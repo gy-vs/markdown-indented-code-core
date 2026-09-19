@@ -110,7 +110,18 @@ export class _Lexer<ParserOutput = string, RendererOutput = string> {
       src = src.replace(other.tabCharGlobal, '    ').replace(other.spaceLine, '');
     }
 
+    let srcLength = Infinity;
     while (src) {
+      // every successful token must consume a positive length of input;
+      // if src stopped shrinking a tokenizer returned an empty raw and
+      // continuing would spin on the same input forever
+      if (src.length < srcLength) {
+        srcLength = src.length;
+      } else {
+        this.infiniteLoopError(src.charCodeAt(0));
+        break;
+      }
+
       let token: Tokens.Generic | undefined;
 
       if (this.options.extensions?.block?.some((extTokenizer) => {
@@ -275,13 +286,8 @@ export class _Lexer<ParserOutput = string, RendererOutput = string> {
       }
 
       if (src) {
-        const errMsg = 'Infinite loop on byte: ' + src.charCodeAt(0);
-        if (this.options.silent) {
-          console.error(errMsg);
-          break;
-        } else {
-          throw new Error(errMsg);
-        }
+        this.infiniteLoopError(src.charCodeAt(0));
+        break;
       }
     }
 
@@ -334,7 +340,17 @@ export class _Lexer<ParserOutput = string, RendererOutput = string> {
 
     let keepPrevChar = false;
     let prevChar = '';
+    let srcLength = Infinity;
     while (src) {
+      // a successful inline token must always consume input; bail out
+      // instead of looping on the same slice if a tokenizer returns empty
+      if (src.length < srcLength) {
+        srcLength = src.length;
+      } else {
+        this.infiniteLoopError(src.charCodeAt(0));
+        break;
+      }
+
       if (!keepPrevChar) {
         prevChar = '';
       }
@@ -464,16 +480,20 @@ export class _Lexer<ParserOutput = string, RendererOutput = string> {
       }
 
       if (src) {
-        const errMsg = 'Infinite loop on byte: ' + src.charCodeAt(0);
-        if (this.options.silent) {
-          console.error(errMsg);
-          break;
-        } else {
-          throw new Error(errMsg);
-        }
+        this.infiniteLoopError(src.charCodeAt(0));
+        break;
       }
     }
 
     return tokens;
+  }
+
+  private infiniteLoopError(byte: number) {
+    const errMsg = 'Infinite loop on byte: ' + byte;
+    if (this.options.silent) {
+      console.error(errMsg);
+    } else {
+      throw new Error(errMsg);
+    }
   }
 }

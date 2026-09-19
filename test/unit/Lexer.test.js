@@ -1,6 +1,7 @@
 import { Lexer } from '../../lib/marked.esm.js';
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
+import { Worker } from 'node:worker_threads';
 
 function expectTokens({ md, options, tokens = [], links = {}, log = false }) {
   const lexer = new Lexer(options);
@@ -91,6 +92,142 @@ describe('Lexer', () => {
           { type: 'code', raw: '```text\ncode\n```', text: 'code', lang: 'text' },
         ],
       });
+    });
+  });
+
+  // Regression test for https://github.com/markedjs/marked/issues/3947
+  // An indented code block followed by a blank-looking line containing
+  // vertical whitespace (e.g. \v or \f) made the code tokenizer return an
+  // empty raw token, so the lexer consumed nothing and looped forever.
+  describe('indented code blank line', () => {
+    // Runs the lexer/parser on a worker thread so a CPU-bound infinite loop
+    // can be killed instead of hanging the suite. In-process timers only
+    // fire when the event loop yields, which a spinning lexer never does.
+    const TIMEOUT_MS = 2000;
+    function runWithTimeout(mode, md, options) {
+      return new Promise((resolve, reject) => {
+        const worker = new Worker(new URL('./fixtures/lex-timeout-worker.mjs', import.meta.url));
+        const timer = setTimeout(() => {
+          worker.terminate();
+          reject(new Error('lexer did not finish within ' + TIMEOUT_MS + 'ms (infinite loop?)'));
+        }, TIMEOUT_MS);
+        worker.once('message', (msg) => {
+          clearTimeout(timer);
+          worker.terminate();
+          if (msg.error) {
+            reject(new Error(msg.error));
+          } else {
+            resolve(msg.result);
+          }
+        });
+        worker.once('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        worker.postMessage({ mode, md, options });
+      });
+    }
+    const lexWithTimeout = (md, options) => runWithTimeout('lex', md, options);
+    const parseWithTimeout = (md, options) => runWithTimeout('parse', md, options);
+
+    it('does not loop on a tab-indented line with vertical tab (LF)', async() => {
+      const md = '\t\v\n';
+      const tokens = await lexWithTimeout(md);
+      assert.deepStrictEqual([...tokens], [
+        { type: 'code', raw: '\t\v\n', text: '\v\n', codeBlockStyle: 'indented' },
+      ]);
+      // the only token consumes the whole input, so no zero-length token
+      // can ever be visited again
+      assert.strictEqual(tokens[0].raw.length, md.length);
+    });
+
+    it('does not loop on a form-feed line and normalizes CRLF', async() => {
+      const md = '\t\f\r\n';
+      const tokens = await lexWithTimeout(md);
+      assert.deepStrictEqual([...tokens], [
+        { type: 'code', raw: '\t\f\n', text: '\f\n', codeBlockStyle: 'indented' },
+      ]);
+      assert.ok(tokens.every(token => token.raw.length > 0));
+    });
+
+    it('keeps the vertical-whitespace line as code and resumes at the paragraph', async() => {
+      const md = '    code\n\t\v\n\nparagraph\n';
+      const tokens = await lexWithTimeout(md);
+      assert.deepStrictEqual(tokens.map(token => token.type), ['code', 'space', 'paragraph']);
+      assert.strictEqual(tokens[0].raw, '    code\n\t\v');
+      assert.strictEqual(tokens[0].text, 'code\n\v');
+      assert.strictEqual(tokens[1].raw, '\n\n');
+      assert.strictEqual(tokens[2].raw, 'paragraph\n');
+      // the next block starts where the code and space tokens end
+      assert.strictEqual(
+        tokens[0].raw.length + tokens[1].raw.length,
+        md.indexOf('paragraph'),
+      );
+    });
+
+    it('consumes multiple blank-looking lines and all of the input', async() => {
+      const md = '    code\n\t\v\n\t\f\n     \n\nparagraph\n';
+      const tokens = await lexWithTimeout(md);
+      assert.deepStrictEqual(tokens.map(token => token.type), ['code', 'space', 'paragraph']);
+      assert.strictEqual(tokens[0].raw, '    code\n\t\v\n\t\f');
+      assert.strictEqual(tokens[0].text, 'code\n\v\n\f');
+      assert.strictEqual(tokens[1].raw, '\n     \n\n');
+      assert.strictEqual(tokens[2].raw, 'paragraph\n');
+      assert.ok(tokens.every(token => token.raw.length > 0));
+      const consumed = tokens.reduce((len, token) => len + token.raw.length, 0);
+      assert.strictEqual(consumed, md.length);
+    });
+
+    it('handles a normal spaces-only blank line after code (LF)', async() => {
+      const md = '    code\n    \n\nnext\n';
+      const tokens = await lexWithTimeout(md);
+      assert.deepStrictEqual(tokens.map(token => token.type), ['code', 'space', 'paragraph']);
+      assert.strictEqual(tokens[0].raw, '    code');
+      assert.strictEqual(tokens[1].raw, '\n    \n\n');
+      assert.strictEqual(tokens[2].raw, 'next\n');
+    });
+
+    it('handles a normal spaces-only blank line after code (CRLF)', async() => {
+      const md = '    code\r\n    \r\n\r\nnext\r\n';
+      const tokens = await lexWithTimeout(md);
+      assert.deepStrictEqual(tokens.map(token => token.type), ['code', 'space', 'paragraph']);
+      assert.strictEqual(tokens[0].raw, '    code');
+      assert.strictEqual(tokens[1].raw, '\n    \n\n');
+      assert.strictEqual(tokens[2].raw, 'next\n');
+    });
+
+    it('handles indented code in a loose list item followed by a paragraph', async() => {
+      const md = '- item\n\n      code\n     \nnext\n';
+      const tokens = await lexWithTimeout(md);
+      assert.strictEqual(tokens[0].type, 'list');
+      const code = tokens[0].items[0].tokens.find(token => token.type === 'code');
+      assert.ok(code, 'expected a code token inside the list item');
+      assert.strictEqual(code.raw, '    code');
+      assert.strictEqual(code.text, 'code');
+      const space = tokens.find(token => token.type === 'space');
+      const paragraph = tokens.find(token => token.type === 'paragraph');
+      assert.strictEqual(space.raw, '\n     \n');
+      assert.strictEqual(paragraph.raw, 'next\n');
+      // the following block starts right after the list raw and its space
+      assert.strictEqual(
+        tokens[0].raw.length + space.raw.length,
+        md.indexOf('next'),
+      );
+    });
+
+    it('produces CommonMark HTML end to end', async() => {
+      assert.strictEqual(
+        await parseWithTimeout('\t\v\n', { gfm: false, pedantic: false }),
+        '<pre><code>\v\n</code></pre>\n',
+      );
+      assert.strictEqual(
+        await parseWithTimeout('    code\n    \n\nnext\n', { gfm: false, pedantic: false }),
+        '<pre><code>code\n</code></pre>\n<p>next</p>\n',
+      );
+      assert.strictEqual(
+        await parseWithTimeout('- item\n\n      code\n     \nnext\n', {}),
+        '<ul>\n<li><p>item</p>\n<pre><code>code\n</code></pre>\n</li>\n</ul>\n<p>next</p>\n',
+      );
     });
   });
 

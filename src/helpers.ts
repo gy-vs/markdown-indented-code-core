@@ -112,7 +112,10 @@ export function rtrim(str: string, c: string, invert?: boolean) {
 export function trimTrailingBlankLines(str: string) {
   const lines = str.split('\n');
   let end = lines.length - 1;
-  while (end >= 0 && !lines[end].trim()) {
+  // A blank line contains only spaces/tabs per CommonMark. Using trim() here
+  // also treats lines with other whitespace (e.g. \v, \f) as blank, which can
+  // strip an indented code block down to an empty token and stall the lexer.
+  while (end >= 0 && other.blankLine.test(lines[end])) {
     end--;
   }
   if (lines.length - end <= 2) {
